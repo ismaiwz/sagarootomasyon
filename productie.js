@@ -1,7 +1,7 @@
 
 (() => {
   'use strict';
-  const VERSION = 'v4.0 · iaydinlik';
+  const VERSION = 'v5.0 · rapor, ad ile bulma, devam';
   if (window.__sagaProd) { try { window.__sagaProd.destroy(); } catch (e) {} }
 
   /* ================== AYARLAR ================== */
@@ -21,7 +21,7 @@
     urlRegex: /Productie\/?([?#].*)?$/i,
     ms: {
       afterAdd: 900, typeChar: 25, afterCode: 1200, afterQty: 300,
-      afterSave: 1500, saveWait: 5000, validateWait: 5000, validateWaitAfterDelete: 8000, step: 450, afterSelect: 700, afterChoiceWait: 15000,
+      afterSave: 1500, saveWait: 5000, validateWait: 5000, validateWaitAfterDelete: 8000, step: 450, afterSelect: 500, afterChoiceWait: 15000,
     },
     maxValidateRounds: 40,   // bir kayıt için en fazla Validate turu
     clearNr: true,            // kayıttan hemen önce Nr. doc alanında bir şey yazıyorsa temizle
@@ -30,6 +30,8 @@
     fixPrice: true,           // Validate bitince CONSUMURI nihai değerine ulaşır; VALOARE ≠ CONSUMURI ise: Devalidez -> PRET = CONSUMURI / CANTITATE -> Alt+S -> tekrar Validate
     verifyLock: true,         // Validate sonrası satırın kilidinin kapandığını kontrol et (grid canlı güncellenmiyorsa false yap)
     confirmValidateAll: true, // Validate All başlamadan önce onay sor (false: sormadan başla)
+    retries: 2,               // geçici hatalarda (satır bulunamadı vb.) kayıt başına yeniden deneme
+    scanMs: 180000,           // tek bir tarama için en çok süre (takılmayı önler)
     stopOnError: true,       // bir satır hata verirse tüm işlem dursun
     decimalComma: false,     // true: 2.5 -> "2,5"
     // Uyarıdaki: "...la articolul PRAF DE COPT (90000005) este mai mare..." -> 1. grup ad, 2. grup kod
@@ -38,7 +40,8 @@
     // Burada olmayan bir soru çıkarsa script dokunmadan durur ve metni loga yazar.
     confirms: [
       { re: /prestabilit/i, btn: '#buttonChooseYes', label: 'Da (Enter)' },
-      { re: /devalid/i, btn: '#buttonChooseYes', label: 'Da' },                // Devalidez onay sorusu
+      { re: /devalid/i, btn: '#buttonChooseYes', label: 'Da' },
+      { re: /renun/i, btn: '#buttonChooseYes', label: 'Da' },                   // Renunt (vazgeç) onay sorusu                // Devalidez onay sorusu
       // "Se incearca descarcarea unei intrari posterioare datei documentului. ... Continuam?" -> Da (toate), yoksa Da
       { re: /posterioare datei/i, btn: ['#buttonChooseYesAll', '#buttonChooseYes'], label: 'Da (toate)', enter: false, collect: true },   // "Sunteti sigur ca nu doriti completarea pretului prestabilit?"
     ],
@@ -56,16 +59,46 @@
   const checkStop = () => { if (state.stop) throw new Error('STOP'); };
   let host;
 
+  // Hata türleri: transient = geçici (yeniden denenebilir), skip = ürün bulunamadı vb. (atlanır, işlem durmaz)
+  const terr = msg => { const e = new Error(msg); e.transient = true; return e; };
+  const skipErr = msg => { const e = new Error(msg); e.skip = true; return e; };
+  const isOnline = () => navigator.onLine !== false;
+  async function waitOnline() {
+    if (isOnline()) return;
+    log('İnternet yok, bağlantı bekleniyor…', 'warn');
+    while (!isOnline()) { checkStop(); await sleep(1500); }
+    log('Bağlantı geri geldi, devam ediliyor', 'good');
+    await sleep(1500);
+  }
+
   async function waitFor(fn, timeout = 8000, step = 100) {
-    const t0 = Date.now();
+    let t0 = Date.now();
     while (Date.now() - t0 < timeout) {
       checkStop();
+      if (!isOnline()) { const p = Date.now(); await waitOnline(); t0 += Date.now() - p; }   // çevrimdışı süre zaman aşımına sayılmaz
       const v = fn();
       if (v) return v;
       await sleep(step);
     }
     return null;
   }
+
+  // Ürün adı normalleştirme: büyük harf, aksansız, noktalama yok, "(OTOPENI)" eki yok
+  const normName = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase()
+    .replace(/[()\[\],.;:\/\\\-+*'"]+/g, ' ').replace(/\s+/g, ' ').trim()
+    .split(' ').filter(w => w && w !== 'OTOPENI').join(' ');
+
+  // Ad -> kod önbelleği (kalıcı)
+  const NAME_KEY = '__sagaProdNames';
+  let nameMap = {};
+  try { nameMap = JSON.parse(localStorage.getItem(NAME_KEY) || '{}'); } catch (e) {}
+  const saveNames = () => { try { localStorage.setItem(NAME_KEY, JSON.stringify(nameMap)); } catch (e) {} };
+  function learnName(name, code) {
+    const k = normName(name);
+    if (k && /^\d{4,}$/.test(String(code || '')) && nameMap[k] !== code) { nameMap[k] = code; saveNames(); }
+  }
+  // Ana listede görünen satırlardan (kod + denumire) ad -> kod öğren
+  function harvestNames() { try { mainRows().forEach(r => learnName(fieldText(r, 'DENUMIRE'), fieldText(r, 'COD'))); } catch (e) {} }
 
   const KEYS = { Enter: 13, Escape: 27, Delete: 46, Tab: 9, ArrowDown: 40 };
   function key(k, opt = {}, target) {
@@ -239,6 +272,74 @@
     codeEl.blur();
   }
 
+  // Açık ekleme/düzenleme formundan vazgeç (Renunt)
+  async function cancelEdit() {
+    const b = $$('#toolbarCRUD_Productie button').find(x => visible(x) && /renunt/i.test(x.textContent));
+    if (!b) return false;
+    b.click();
+    const t0 = Date.now();
+    while (Date.now() - t0 < 4000) {
+      if (await handleChoice()) continue;
+      if (!isEnabled($(CFG.sel.save))) return true;
+      await sleep(150);
+    }
+    return !isEnabled($(CFG.sel.save));
+  }
+
+  // Kod kutusunun altında açılan öneri satırları
+  function suggestionRows(codeEl) {
+    let list = $$(CFG.sel.suggestion).filter(e => visible(e) && !host.contains(e));
+    if (!list.length) {
+      const ir = codeEl.getBoundingClientRect();
+      list = $$('li, tr, [role="option"]').filter(el => {
+        if (!visible(el) || el.contains(codeEl) || el.closest('tr.rowSelectable_Productie, tr.rowSelectable_ProductieDetalii')) return false;
+        const r = el.getBoundingClientRect();
+        return r.top >= ir.bottom - 5 && r.top <= ir.bottom + 450 && r.right >= ir.left && r.left <= ir.right + 400;
+      });
+    }
+    return list;
+  }
+
+  // Öneriler arasında ada en iyi uyan: tam eşit (3) veya ad ile başlayan (2). Daha zayıf eşleşme kabul edilmez.
+  function bestSuggestion(codeEl, tn) {
+    let best = null, bs = 0;
+    for (const el of suggestionRows(codeEl)) {
+      const raw = el.textContent.replace(/\s+/g, ' ').trim();
+      if (!raw || raw.length > 250) continue;
+      const m = raw.match(/\b(\d{4,})\b/), code = m ? m[1] : '';
+      const cells = Array.from(el.children).map(c => normName(c.textContent)).filter(Boolean);
+      const rest = normName(code ? raw.replace(code, ' ') : raw);
+      let sc = 0;
+      if (rest === tn || cells.includes(tn)) sc = 3;
+      else if (rest.startsWith(tn + ' ')) sc = 2;
+      if (!sc) continue;
+      if (sc > bs || (sc === bs && /otopeni/i.test(raw) && !/otopeni/i.test(best.raw))) { best = { el, code, raw }; bs = sc; }
+    }
+    return best;
+  }
+
+  // Kod yoksa: adı koda yazıp açılan listeden seç. Bulamazsa '' döner.
+  async function pickByName(codeEl, name) {
+    const tn = normName(name);
+    const clean = String(name).replace(/\s+/g, ' ').trim();
+    const words = clean.split(' ');
+    const queries = [clean];
+    if (words.length >= 3) queries.push(words.slice(0, 2).join(' '));
+    for (const qy of queries) {
+      await typeInto(codeEl, qy);
+      const best = await waitFor(() => bestSuggestion(codeEl, tn), 2500, 200);
+      if (!best) continue;
+      log('   ada göre öneri seçildi: ' + best.raw.slice(0, 80));
+      clickEl(best.el);
+      await sleep(400);
+      const v = String(codeEl.value || '').trim();
+      const code = best.code || (/^\d{4,}$/.test(v) ? v : '');
+      if (code) learnName(name, code);
+      return code || '*';
+    }
+    return '';
+  }
+
   // Ekleme formundaki Tarih alanını doldurur (gg.aa.yyyy)
   async function setDateField(tarih) {
     if (!tarih) return;
@@ -286,21 +387,35 @@
   async function addRecord(row) {
     if (!isProductie()) throw new Error('Productie sayfasında değilsin');
     const tarih = resolveDate(row);                       // geçersizse Ekle'ye basmadan hata ver
+    if (!row.kod && !row.ad) throw skipErr('Kod ve ad boş');
+    harvestNames();
+    let code = row.kod || nameMap[normName(row.ad)] || '';
+    if (!row.kod && code) log(`   ad -> kod (önbellek): ${row.ad} -> ${code}`);
+    if (isEnabled($(CFG.sel.save))) {                     // önceki işlemden açık form kalmışsa kapat
+      log('   açık düzenleme formu kapatılıyor (Renunt)', 'warn');
+      await cancelEdit(); await sleep(400);
+    }
     const addBtn = await waitFor(() => $(CFG.sel.add), 6000);
-    if (!addBtn) throw new Error('Ekle butonu bulunamadı');
+    if (!addBtn) throw terr('Ekle butonu bulunamadı');
     addBtn.click();
     await sleep(CFG.ms.afterAdd);
 
     const codeEl = await waitFor(() => { const x = $(CFG.sel.code); return visible(x) ? x : null; }, 8000);
-    if (!codeEl) throw new Error('Kod alanı açılmadı');
+    if (!codeEl) throw terr('Kod alanı açılmadı');
     await setDateField(tarih);                            // önce tarih, sonra kod (fiyat/stok tarihe göre gelir)
-    await typeInto(codeEl, row.kod);
-    await pickCode(codeEl, row.kod);
+    if (code) {
+      await typeInto(codeEl, code);
+      await pickCode(codeEl, code);
+    } else {
+      const got = await pickByName(codeEl, row.ad);
+      if (!got) { await cancelEdit(); throw skipErr(`Ürün bulunamadı: ${row.ad}`); }
+      code = got;
+    }
     await sleep(CFG.ms.afterCode);
-    if (!(await checkGestiune())) throw new Error('Kod seçilemedi: Gestiune alanı dolmadı (kaydedilmedi)');
+    if (!(await checkGestiune())) { await cancelEdit(); throw skipErr('Ürün seçilemedi (Gestiune dolmadı): ' + (row.kod || row.ad)); }
 
     const qtyEl = await waitFor(() => { const x = $(CFG.sel.qty); return visible(x) ? x : null; }, 5000);
-    if (!qtyEl) throw new Error('Adet alanı bulunamadı');
+    if (!qtyEl) throw terr('Adet alanı bulunamadı');
     qtyEl.focus(); qtyEl.select && qtyEl.select();
     setVal(qtyEl, toQty(row.adet));
     qtyEl.dispatchEvent(new Event('change', { bubbles: true }));
@@ -311,6 +426,7 @@
     if (sw) {
       const t = (sw.innerText || sw.textContent || '').replace(/\s+/g, ' ').trim();
       await dismissModal(sw);
+      if (/gestiun/i.test(t)) { await cancelEdit(); throw skipErr('Kayıt yapılamadı (gestiune dolmadı): ' + (row.kod || row.ad)); }
       throw new Error('Kayıt başarısız: ' + t);
     }
   }
@@ -557,7 +673,7 @@
       if (sels.some(x => rowSig(x) === id)) return;
       log('   satır seçilemedi, tekrar deneniyor', 'warn');
     }
-    throw new Error('Satır seçilemedi, yanlış kayda Validate basılmaması için durdum');
+    throw terr('Satır seçilemedi, yanlış kayda Validate basılmaması için durdum');
   }
 
   // Ana listedeki bir satırı izlemek için: data-rowid varsa onunla, yoksa eleman referansıyla
@@ -568,7 +684,7 @@
     if (!CFG.verifyLock) return;
     let r = null;
     const ok = await waitFor(() => { r = getRow(ctx); return !r || !isUnlocked(r); }, 8000, 200);
-    if (!ok) throw new Error('Validate bitti ama satırın kilidi kapanmadı (grid canlı güncellenmiyorsa CFG.verifyLock=false yap)');
+    if (!ok) throw terr('Validate bitti ama satırın kilidi kapanmadı (grid canlı güncellenmiyorsa CFG.verifyLock=false yap)');
     if (!r) log('   (satır ekranda değil, kilit kontrol edilemedi)', 'warn');
   }
 
@@ -642,7 +758,7 @@
       if (r && isUnlocked(r)) return;
       await sleep(150);
     }
-    throw new Error('Devalidare olmadı (kilit açılmadı)');
+    throw terr('Devalidare olmadı (kilit açılmadı)');
   }
 
   // Validate bittikten sonra CONSUMURI nihai değerine ulaşır. VALOARE ≠ CONSUMURI ise:
@@ -689,15 +805,17 @@
   }
 
   // Ekleme sonrası yeni kaydın ana listedeki satırını bulur (kod + adet eşleşen, kilidi açık, en yeni)
-  async function locateAddedRow(r) {
-    const kod = norm(r.kod), qty = parseNum(r.adet);
+  async function locateAddedRow(r, timeout = 4000) {
+    const code = r.kod || nameMap[normName(r.ad)] || '';
+    if (!code) return null;
+    const kod = norm(code), qty = parseNum(r.adet);
     const rid = x => x.dataset.rowid ? +x.dataset.rowid : Infinity;     // rowid'si olmayan = istemcide yeni eklenmiş
     const found = await waitFor(() => {
       const c = mainRows().filter(x => norm(fieldText(x, 'COD')) === kod && isUnlocked(x)
         && (Number.isNaN(qty) || Math.abs(parseNum(fieldText(x, 'CANTITATE')) - qty) < 0.0005));
       c.sort((x, y) => rid(y) - rid(x));
       return c[0] || null;
-    }, 4000, 200);
+    }, timeout, 200);
     if (!found) return null;
     await sleep(600);                                                    // tutarların oturması için
     return ctxOf(found);
@@ -724,7 +842,7 @@
     if (!isEnabled(editBtn)) throw new Error('Modific pasif (kayıt kilitli)');
     editBtn.click();
     const qtyEl = await waitFor(() => { const x = $(CFG.sel.qty); return visible(x) ? x : null; }, 6000);
-    if (!qtyEl) throw new Error('Düzenleme açılmadı (Adet alanı görünmedi; kayıt kilitli olabilir)');
+    if (!qtyEl) throw terr('Düzenleme açılmadı (Adet alanı görünmedi; kayıt kilitli olabilir)');
     await sleep(400);
     const old = String(qtyEl.value).trim();
     const nu = bumpQty(old, step);
@@ -763,61 +881,71 @@
     return false;
   }
 
-  // Liste tarihe göre artan sıralıysa hedef tarihe ikili aramayla atlar (baştan kaydırmaz)
-  async function seekDate(f) {
+  // Liste tarihe göre artan sıralıysa hedef tarihe ikili aramayla atlar (baştan kaydırmaz).
+  // Aralığın başı/sonu zaten listenin başında/sonundaysa aramaz. Süre sınırı vardır (takılmayı önler).
+  async function seekDate(f, budget = 30000) {
     if (f.mode === 'all' || !f.from) return;
+    const t0 = Date.now(), over = () => Date.now() - t0 > budget;
     const first = mainRows()[0];
     const sp = first && scrollParent(first);
     if (!sp) return;
-    const settle = async () => { const b = sigOfList(); await sleep(120); await waitFor(() => sigOfList() !== b, 500, 50); };
+    const settle = async () => { const b = sigOfList(); await sleep(60); await waitFor(() => sigOfList() !== b, 450, 40); };
     const span = () => { const ds = mainRows().map(rowYmd).filter(Boolean); return ds.length ? [Math.min(...ds), Math.max(...ds)] : null; };
-    sp.scrollTop = 0; await settle(); const top = span();
-    sp.scrollTop = sp.scrollHeight; await settle(); const bottom = span();
-    if (!top || !bottom || top[0] > bottom[1]) { sp.scrollTop = 0; await settle(); log('   (liste tarihe göre artan görünmüyor, baştan taranacak)', 'warn'); return; }
-    let lo = 0, hi = sp.scrollHeight;
-    for (let i = 0; i < 16 && hi - lo > 4; i++) {
+    log('   tarihe gidiliyor…');
+    sp.scrollTop = 0; await settle();
+    const top = span();
+    if (!top) return;
+    if (f.to && top[0] > f.to) { log('   aralık listenin başından önce kalıyor: kayıt yok', 'warn'); return; }
+    if (top[0] >= f.from) { log('   aralığın başı listenin başında, baştan taranıyor'); return; }          // en baş zaten aralıkta/içinde
+    sp.scrollTop = sp.scrollHeight; await settle();
+    const bottom = span();
+    if (!bottom || top[0] > bottom[1]) { sp.scrollTop = 0; await settle(); log('   (liste tarihe göre artan görünmüyor, baştan taranacak)', 'warn'); return; }
+    if (bottom[1] < f.from) { log('   aralık yüklü listenin sonunda/ötesinde, aşağı taranıyor'); return; }  // en son zaten orada, tarama aşağı devam eder
+    let lo = 0, hi = sp.scrollHeight, straddled = false;
+    for (let i = 0; i < 16 && hi - lo > 4 && !over(); i++) {
       checkStop();
       const mid = Math.floor((lo + hi) / 2);
       sp.scrollTop = mid; await settle();
-      const s = span();
-      if (!s) break;
-      if (s[1] < f.from) lo = mid;            // pencere tamamen hedeften önce
-      else if (s[0] >= f.from) hi = mid;      // pencere hedefte/sonrasında, yukarıda da olabilir
-      else break;                             // hedef başlangıcı pencerede
+      const s2 = span();
+      if (!s2) break;
+      if (s2[1] < f.from) lo = mid;                      // pencere tamamen hedeften önce
+      else if (s2[0] >= f.from) hi = mid;                // pencere hedefte/sonrasında, yukarıda da olabilir
+      else { straddled = true; break; }                  // hedef başlangıcı pencerede
     }
-    for (let i = 0; i < 300; i++) {           // hedefin biraz üstünden başla
-      const s = span();
-      if (!s || s[0] < f.from || sp.scrollTop <= 0) break;
-      sp.scrollTop = Math.max(0, sp.scrollTop - sp.clientHeight * 0.8); await settle();
-    }
+    if (!straddled) { sp.scrollTop = lo; await settle(); }   // lo: penceresi tamamen aralıktan önce olan son konum
+    log(`   tarihe gidildi (${Math.round((Date.now() - t0) / 1000)} sn)` + (over() ? ' - süre sınırına takıldı, güvenli konumdan taranıyor' : ''));
   }
 
   // Kilitli (validate edilmiş) satır: VALIDAT hücresi var ve açık kilit ikonu yok
   const isLockedRow = r => { const c = r.querySelector('td.rowCell_VALIDAT'); return !!c && !c.querySelector('i.fa-unlock-alt'); };
 
-  // 1. AŞAMA: aralıktaki kilidi açık tüm satırları sırayla TOPLAR (işlem yapmaz).
+  // 1. AŞAMA: aralıktaki (kilidi açık / kilitli) tüm satırları sırayla TOPLAR (işlem yapmaz).
   // Her satır için görüldüğü kaydırma konumunu da saklar, sonra doğrudan oraya dönülür.
   async function collectRows(f, locked = false) {
+    const t0 = Date.now();
     if (f.mode === 'all') {
       const first = mainRows()[0], sp0 = first && scrollParent(first);
-      if (sp0) { sp0.scrollTop = 0; await sleep(400); }
+      if (sp0) { sp0.scrollTop = 0; await sleep(300); }
     } else {
       await seekDate(f);
     }
     const items = [], seen = new Set();
     for (let step = 0; step < 6000; step++) {
       checkStop();
+      if (Date.now() - t0 > CFG.scanMs) { log('   tarama süre sınırına ulaştı, o ana kadar bulunanlarla devam ediliyor', 'warn'); break; }
       const rows = mainRows();
       const sp = rows[0] && scrollParent(rows[0]);
       const pos = sp ? sp.scrollTop : 0;
-      let minD = Infinity;
+      let minD = Infinity, maxD = 0;
       for (const r of rows) {
         const id = rowSig(r), d = rowYmd(r);
-        if (d) minD = Math.min(minD, d);
+        if (d) { minD = Math.min(minD, d); maxD = Math.max(maxD, d); }
         if (seen.has(id)) continue;
         seen.add(id);
+        learnName(fieldText(r, 'DENUMIRE'), fieldText(r, 'COD'));
         if ((locked ? isLockedRow(r) : isUnlocked(r)) && inFilter(r, f)) items.push({ id, label: rowLabel(r), pos });
       }
+      if (step && step % 15 === 0) log(`   taranıyor… ${seen.size} satır görüldü, ${items.length} uygun, son tarih ${maxD ? String(maxD).replace(/^(\d{4})(\d{2})(\d{2})$/, '$3.$2.$1') : '?'}`);
       if (f.mode !== 'all' && f.to && minD !== Infinity && minD > f.to) break;   // artan listede aralık bitti
       if (!(await scrollDown(true))) break;                                      // liste sonu
     }
@@ -845,6 +973,63 @@
     return find() || null;
   }
 
+  /* ---- Yarım kalan işi kaydet / devam et (internet gitse, sayfa yenilense, hata olsa) ---- */
+  const JOB_KEY = '__sagaProdJob';
+  const loadJob = () => { try { return JSON.parse(localStorage.getItem(JOB_KEY) || 'null'); } catch (e) { return null; } };
+  const saveJob = j => { try { localStorage.setItem(JOB_KEY, JSON.stringify(j)); } catch (e) {} };
+  const clearJob = () => { try { localStorage.removeItem(JOB_KEY); } catch (e) {} };
+
+  // Toplu iş: tara -> sırayla işle. Her biten kayıt kalıcı olarak işaretlenir; yarım kalırsa kaldığı yerden devam eder.
+  async function batchRun({ kind, fkey, f, locked, title, processItem }) {
+    let job = loadJob(), resumeList = null;
+    if (job && job.fkey === fkey) {
+      const remain = job.items.filter(it => !job.done.includes(it.id));
+      if (remain.length && confirm(`Yarım kalan iş var (${f.text}): ${job.done.length}/${job.items.length} tamamlanmış.\nKaldığı yerden devam edilsin mi?\n\n(İptal = baştan tara)`)) {
+        resumeList = remain;
+        log(`Kaldığı yerden devam: ${remain.length} kayıt kaldı (${job.done.length} tamamlanmıştı)`, 'good');
+      }
+    }
+    if (!resumeList) job = { fkey, kind, items: [], done: [], at: Date.now() };
+    const failed = new Set();
+    let ok = 0, fail = 0;
+    outer:
+    for (let round = 1; round <= 2; round++) {
+      let list;
+      if (round === 1 && resumeList) list = resumeList;
+      else {
+        log(round === 1 ? 'Kayıtlar taranıyor…' : 'Kalan var mı diye tekrar taranıyor…');
+        list = (await collectRows(f, locked)).filter(it => !failed.has(it.id) && !job.done.includes(it.id));
+        const known = new Set(job.items.map(it => it.id));
+        list.forEach(it => { if (!known.has(it.id)) job.items.push(it); });
+        saveJob(job);
+      }
+      if (!list.length) { log(round === 1 ? 'Filtreye uyan kayıt yok' : 'Kalan kayıt yok', 'good'); break; }
+      log(`${list.length} kayıt bulundu, bu sırayla işlenecek:`, 'good');
+      list.slice(0, 40).forEach((it, i) => log(`   ${i + 1}. ${it.label}`));
+      if (list.length > 40) log(`   … ve ${list.length - 40} kayıt daha`);
+      for (let i = 0; i < list.length; i++) {
+        checkStop();
+        q('pb').style.width = (i / list.length * 100) + '%';
+        const it = list[i];
+        log(`> [${i + 1}/${list.length}] ${it.label}`);
+        try {
+          await waitOnline();
+          const res = await withRetry(() => processItem(it, i, list.length));
+          if (res !== 'skip') ok++;
+          job.done.push(it.id); saveJob(job);                   // bu kayıt bitti: kalıcı işaretle
+        } catch (err) {
+          if (err.message === 'STOP') throw err;
+          fail++; failed.add(it.id);
+          log(`[HATA] [${i + 1}/${list.length}] ${it.label}: ${err.message}`, 'err');
+          if (CFG.stopOnError) break outer;
+        }
+      }
+    }
+    q('pb').style.width = '100%';
+    if (!fail) clearJob(); else log('Hatalı kayıtlar var: işi tekrar başlatırsan kaldığı yerden devam teklif edilir.', 'warn');
+    log(`${title} bitti: ${ok} başarılı, ${fail} hatalı`, fail ? 'warn' : 'good');
+  }
+
   // Seçili tarihteki / aralıktaki KİLİTLİ tüm kayıtların kilidini açar (Devalidez)
   async function unlockAllPage() {
     let f;
@@ -853,40 +1038,18 @@
     if (!mainRows().length) return log('Ana listede satır bulunamadı (' + CFG.sel.mainRow + ')', 'err');
     if (!confirm(`${f.text} KİLİTLİ tüm kayıtların kilidi açılacak (Devalidez).\nBaşlatılsın mı?`)) return;
     log(`Kilit açma başladı (${f.text})`);
-    const failed = new Set();
-    let ok = 0, fail = 0;
-    outer:
-    for (let round = 1; round <= 2; round++) {
-      log(round === 1 ? 'Kilitli kayıtlar taranıyor…' : 'Kalan kilitli var mı diye tekrar taranıyor…');
-      const items = (await collectRows(f, true)).filter(it => !failed.has(it.id));
-      if (!items.length) { log(round === 1 ? 'Filtreye uyan kilitli kayıt yok' : 'Kalan kilitli kayıt yok', 'good'); break; }
-      log(`${items.length} kilitli kayıt bulundu, bu sırayla açılacak:`, 'good');
-      items.slice(0, 40).forEach((it, i) => log(`   ${i + 1}. ${it.label}`));
-      if (items.length > 40) log(`   … ve ${items.length - 40} kayıt daha`);
-      for (let i = 0; i < items.length; i++) {
-        checkStop();
-        q('pb').style.width = (i / items.length * 100) + '%';
-        const it = items[i], t0 = Date.now();
-        log(`> [${i + 1}/${items.length}] ${it.label}`);
-        try {
-          const row = await locateRow(it);
-          if (!row) throw new Error('Satır ekranda bulunamadı (liste yeniden yüklenmiş olabilir)');
-          if (isUnlocked(row)) { log('   zaten açık, atlandı', 'warn'); continue; }
-          await selectMainRow(row);
-          const ctx = ctxOf(getRow(ctxOf(row)) || row);
-          await devalidate(ctx);
-          ok++;
-          log(`[OK] [${i + 1}/${items.length}] kilit açıldı (${Math.round((Date.now() - t0) / 1000)} sn)`, 'good');
-        } catch (err) {
-          if (err.message === 'STOP') throw err;
-          fail++; failed.add(it.id);
-          log(`[HATA] [${i + 1}/${items.length}] ${it.label}: ${err.message}`, 'err');
-          if (CFG.stopOnError) break outer;
-        }
-      }
-    }
-    q('pb').style.width = '100%';
-    log(`Kilit açma bitti: ${ok} açıldı, ${fail} hatalı`, fail ? 'warn' : 'good');
+    await batchRun({
+      kind: 'unlock', fkey: 'unlock|' + f.text, f, locked: true, title: 'Kilit açma',
+      processItem: async (it, i, total) => {
+        const t0 = Date.now();
+        const row = await locateRow(it);
+        if (!row) throw terr('Satır ekranda bulunamadı (liste yeniden yüklenmiş olabilir)');
+        if (isUnlocked(row)) { log('   zaten açık, atlandı', 'warn'); return 'skip'; }
+        await selectMainRow(row);
+        await devalidate(ctxOf(getRow(ctxOf(row)) || row));
+        log(`[OK] [${i + 1}/${total}] kilit açıldı (${Math.round((Date.now() - t0) / 1000)} sn)`, 'good');
+      },
+    });
   }
 
   async function validateAllPage() {
@@ -903,65 +1066,52 @@
       : `Ana listede kilidi açık kayıtlar validate edilecek (${f.text}).\nStok hatası veren kalemler kayıttan silinip kaydedilecek.\nBaşlatılsın mı?`;
     if (CFG.confirmValidateAll && !confirm(sure)) return;
     log(`Validate All başladı (${f.text})`);
-    const failed = new Set();
-    let ok = 0, fail = 0;
-    outer:
-    for (let round = 1; round <= 2; round++) {
-      log(round === 1 ? 'Kayıtlar taranıyor…' : 'Kalan var mı diye tekrar taranıyor…');
-      const items = (await collectRows(f)).filter(it => !failed.has(it.id));
-      if (!items.length) { log(round === 1 ? 'Filtreye uyan kilidi açık kayıt yok' : 'Kalan kayıt yok', 'good'); break; }
-      log(`${items.length} kayıt bulundu, bu sırayla işlenecek:`, 'good');
-      items.slice(0, 40).forEach((it, i) => log(`   ${i + 1}. ${it.label}`));
-      if (items.length > 40) log(`   … ve ${items.length - 40} kayıt daha`);
-      for (let i = 0; i < items.length; i++) {
-        checkStop();
-        q('pb').style.width = (i / items.length * 100) + '%';
-        const it = items[i], t0 = Date.now();
-        log(`> [${i + 1}/${items.length}] ${it.label}`);
-        try {
-          const row = await locateRow(it);
-          if (!row) throw new Error('Satır ekranda bulunamadı (liste yeniden yüklenmiş olabilir)');
-          if (!isUnlocked(row)) { log('   zaten kilitli, atlandı', 'warn'); continue; }
-          await selectMainRow(row);
-          if (!isUnlocked(getRow(ctxOf(row)) || row)) { log('   kilitli, düzenleme ve validate atlandı', 'warn'); continue; }
-          if (bump) {
-            if (bumped.has(it.id)) log('   adet daha önce artırılmış, sadece validate', 'warn');
-            else { await bumpQuantity(bump); bumped.add(it.id); saveBumped(bumped); }
-          }
-          const ctx = ctxOf(getRow(ctxOf(row)) || row);
-          const t = await validateCycle(ctx);
-          await verifyLocked(ctx);
-          await finalizePrice(ctx);
-          ok++;
-          log(`[OK] [${i + 1}/${items.length}] doğrulandı (${t} tur, ${Math.round((Date.now() - t0) / 1000)} sn)`, 'good');
-        } catch (err) {
-          if (err.message === 'STOP') throw err;
-          fail++; failed.add(it.id);
-          log(`[HATA] [${i + 1}/${items.length}] ${it.label}: ${err.message}`, 'err');
-          if (CFG.stopOnError) break outer;
+    await batchRun({
+      kind: 'validate', fkey: `validate|${f.text}|b${bump}`, f, locked: false, title: 'Validate All',
+      processItem: async (it, i, total) => {
+        const t0 = Date.now();
+        const row = await locateRow(it);
+        if (!row) throw terr('Satır ekranda bulunamadı (liste yeniden yüklenmiş olabilir)');
+        if (!isUnlocked(row)) { log('   zaten kilitli, atlandı', 'warn'); return 'skip'; }
+        await selectMainRow(row);
+        if (!isUnlocked(getRow(ctxOf(row)) || row)) { log('   kilitli, düzenleme ve validate atlandı', 'warn'); return 'skip'; }
+        if (bump) {
+          if (bumped.has(it.id)) log('   adet daha önce artırılmış, sadece validate', 'warn');
+          else { await bumpQuantity(bump); bumped.add(it.id); saveBumped(bumped); }
         }
-      }
-    }
-    q('pb').style.width = '100%';
-    log(`Validate All bitti: ${ok} başarılı, ${fail} hatalı`, fail ? 'warn' : 'good');
+        const ctx = ctxOf(getRow(ctxOf(row)) || row);
+        const t = await validateCycle(ctx);
+        await verifyLocked(ctx);
+        await finalizePrice(ctx);
+        log(`[OK] [${i + 1}/${total}] doğrulandı (${t} tur, ${Math.round((Date.now() - t0) / 1000)} sn)`, 'good');
+      },
+    });
   }
 
   /* ================== SATIR İŞ AKIŞLARI ================== */
   async function addOne(r) {
     let added = false;
+    r.saved = false;
     setState(r, 'calisiyor');
     try {
-      await addRecord(r);
-      added = true;
+      let ctx = null;
+      if (r.resume) {                                   // yarım kalmış işlemden devam: kayıt zaten oluşmuş olabilir
+        r.resume = false;
+        ctx = await locateAddedRow(r, 1500);
+        if (ctx) log('   önceki yarım işlemden kayıt zaten var, tekrar eklenmiyor', 'warn');
+      }
+      if (!ctx) await addRecord(r);
+      added = true; r.saved = true;
       setState(r, 'eklendi');
-      const ctx = await locateAddedRow(r);
+      if (!ctx) ctx = await locateAddedRow(r);
       if (!ctx) log('   (eklenen satır ana listede bulunamadı: fiyat ve kilit kontrolü atlanıyor)', 'warn');
       const t = await validateCycle(ctx);
       if (ctx) { await verifyLocked(ctx); await finalizePrice(ctx); }
       setState(r, 'dogrulandi', `${t}. turda temiz`);
-      log(`[OK] ${r.kod} x ${r.adet} doğrulandı (${t} tur)`, 'good');
+      log(`[OK] ${r.kod || r.ad} x ${r.adet} doğrulandı (${t} tur)`, 'good');
     } catch (err) {
-      setState(r, added ? 'eklendi' : 'hata', err.message === 'STOP' ? 'durduruldu' : err.message);
+      if (err.skip) setState(r, 'atlandi', err.message);
+      else setState(r, added ? 'eklendi' : 'hata', err.message === 'STOP' ? 'durduruldu' : err.message);
       throw err;
     }
   }
@@ -970,14 +1120,16 @@
     const prev = r.state;
     setState(r, 'calisiyor');
     try {
-      const row = await selectRecord(r.kod);
-      if (!isUnlocked(row)) { log(`   ${r.kod}: kayıt kilitli, atlandı`, 'warn'); setState(r, prev, 'kilitli, atlandı'); return; }
+      const code = r.kod || nameMap[normName(r.ad)];
+      if (!code) throw new Error('Kod bilinmiyor (ad önbellekte yok; önce ana listede bu ürün görünmeli)');
+      const row = await selectRecord(code);
+      if (!isUnlocked(row)) { log(`   ${code}: kayıt kilitli, atlandı`, 'warn'); setState(r, prev, 'kilitli, atlandı'); return; }
       const ctx = ctxOf(row);
       const t = await validateCycle(ctx);
       await verifyLocked(ctx);
       await finalizePrice(ctx);
       setState(r, 'dogrulandi', `${t}. turda temiz`);
-      log(`[OK] ${r.kod} doğrulandı (${t} tur)`, 'good');
+      log(`[OK] ${code} doğrulandı (${t} tur)`, 'good');
     } catch (err) {
       setState(r, prev, err.message === 'STOP' ? 'durduruldu' : err.message);
       throw err;
@@ -992,36 +1144,68 @@
     try { await fn(); } finally { state.running = false; updateButtons(); }
   }
 
+  // Geçici hata sonrası sayfayı sakin bir duruma getir (açık form varsa kapat, internet bekle)
+  async function recover() {
+    await waitOnline();
+    try { if (isEnabled($(CFG.sel.save))) await cancelEdit(); } catch (e) {}
+    await sleep(1000);
+  }
+
+  // Geçici hatalarda (err.transient) yeniden dener; canRetry() false ise (örn. kayıt oluşmuşsa) denemez
+  async function withRetry(fn, canRetry = () => true) {
+    for (let attempt = 0; ; attempt++) {
+      try { return await fn(); }
+      catch (err) {
+        if (err.message === 'STOP' || !err.transient || !canRetry() || attempt >= CFG.retries) throw err;
+        log(`   geçici hata (${err.message}); ${attempt + 1}. yeniden deneme…`, 'warn');
+        await recover();
+      }
+    }
+  }
+
   async function loop(todo, fn, title) {
     if (!todo.length) return log('İşlenecek satır yok', 'warn');
     log(`${title}: ${todo.length} satır`);
-    let ok = 0;
+    let ok = 0, skipped = 0;
+    harvestNames();
     for (let i = 0; i < todo.length; i++) {
       q('pb').style.width = (i / todo.length * 100) + '%';
-      try { await fn(todo[i]); ok++; }
-      catch (err) {
+      const r = todo[i], lab = r.kod || r.ad;
+      try {
+        await waitOnline();
+        await withRetry(() => fn(r), () => !(fn === addOne && r.saved));
+        ok++;
+      } catch (err) {
         if (err.message === 'STOP') { log('Durduruldu', 'warn'); break; }
-        log(`[HATA] ${todo[i].kod}: ${err.message}`, 'err');
+        if (err.skip) { skipped++; log(`[ATLANDI] ${lab}: ${err.message}`, 'warn'); continue; }
+        log(`[HATA] ${lab}: ${err.message}`, 'err');
         if (CFG.stopOnError) break;
       }
     }
     q('pb').style.width = '100%';
-    log(`Bitti: ${ok}/${todo.length} başarılı`, ok === todo.length ? 'good' : 'warn');
+    log(`Bitti: ${ok}/${todo.length} başarılı` + (skipped ? `, ${skipped} atlandı` : ''), ok + skipped === todo.length ? 'good' : 'warn');
   }
 
   /* ================== VERİ / TABLO ================== */
-  const LABEL = { bekliyor: 'Bekliyor', calisiyor: 'Çalışıyor…', eklendi: 'Eklendi', dogrulandi: 'Doğrulandı', hata: 'Hata' };
-  const newRow = (kod, adet, tarih = '') => ({ id: state.seq++, kod, adet, tarih, state: 'bekliyor', note: '', sel: false });
+  const LABEL = { bekliyor: 'Bekliyor', calisiyor: 'Çalışıyor…', eklendi: 'Eklendi', dogrulandi: 'Doğrulandı', hata: 'Hata', atlandi: 'Atlandı' };
+  const newRow = (kod, adet, tarih = '', ad = '') => ({ id: state.seq++, kod, ad, adet, tarih, state: 'bekliyor', note: '', sel: false, saved: false });
 
   function persist() {
     try {
-      localStorage.setItem(CFG.storeKey, JSON.stringify(state.list.map(({ id, kod, adet, tarih, state: s, note }) => ({ id, kod, adet, tarih, state: s, note }))));
+      localStorage.setItem(CFG.storeKey, JSON.stringify(state.list.map(({ id, kod, ad, adet, tarih, state: s, note, saved }) => ({ id, kod, ad, adet, tarih, state: s, note, saved }))));
     } catch (e) {}
   }
   function restore() {
     try {
       const d = JSON.parse(localStorage.getItem(CFG.storeKey) || '[]');
-      state.list = d.map(x => ({ ...x, sel: false, ...(x.state === 'calisiyor' ? { state: 'hata', note: 'yarım kalmış, kontrol et' } : {}) }));
+      state.list = d.map(x => {
+        const r = { ad: '', saved: false, ...x, sel: false };
+        if (x.state === 'calisiyor') {                      // yarım kalmış işlem: kaydedilmişse Validate'e, değilse yeniden ekleme
+          if (x.saved) { r.state = 'eklendi'; r.note = 'yarım kalmıştı'; }
+          else { r.state = 'bekliyor'; r.note = 'yarım kalmıştı, yeniden denenecek'; r.resume = true; }
+        }
+        return r;
+      });
       state.seq = Math.max(0, ...state.list.map(x => x.id)) + 1;
     } catch (e) {}
   }
@@ -1037,27 +1221,28 @@
     const c = tr.querySelector('.stc');
     c.textContent = LABEL[r.state];
     c.title = r.note || '';
-    tr.querySelector('.nt').textContent = r.note && r.state === 'hata' ? '(!)' : '';
+    tr.querySelector('.nt').textContent = r.note && (r.state === 'hata' || r.state === 'atlandi') ? '(!)' : '';
   }
 
   function buildRow(r, idx) {
     const tr = document.createElement('tr');
     tr.dataset.id = r.id;
     tr.innerHTML = `<td><input type="checkbox" class="ck"></td><td class="ix">${idx + 1}</td>
-      <td><input class="k" spellcheck="false"></td><td><input class="n" spellcheck="false"></td><td><input class="t" spellcheck="false"></td>
+      <td><input class="k" spellcheck="false"></td><td><input class="a2" spellcheck="false"></td><td><input class="n" spellcheck="false"></td><td><input class="t" spellcheck="false"></td>
       <td><span class="stc"></span><span class="nt"></span></td>
       <td class="act"><button class="run" title="Bu satırı ekle + kaydet + validate">Ekle</button><button class="val" title="Sadece Validate (ana listede bulup)">Validate</button><button class="del" title="Satırı sil">Sil</button></td>`;
-    const k = tr.querySelector('.k'), n = tr.querySelector('.n'), t = tr.querySelector('.t'), ck = tr.querySelector('.ck');
-    k.value = r.kod; n.value = r.adet; t.value = r.tarih || ''; ck.checked = r.sel;
+    const k = tr.querySelector('.k'), a2 = tr.querySelector('.a2'), n = tr.querySelector('.n'), t = tr.querySelector('.t'), ck = tr.querySelector('.ck');
+    k.value = r.kod; a2.value = r.ad || ''; n.value = r.adet; t.value = r.tarih || ''; ck.checked = r.sel;
     t.placeholder = defaultDate() || 'sistem';
     t.oninput = () => { r.tarih = t.value.trim(); persist(); };
     k.oninput = () => { r.kod = k.value.trim(); persist(); updateButtons(); };
+    a2.oninput = () => { r.ad = a2.value.trim(); persist(); updateButtons(); };
     n.oninput = () => { r.adet = n.value.trim(); persist(); updateButtons(); };
     ck.onchange = () => { r.sel = ck.checked; };
     tr.querySelector('.del').onclick = () => { if (state.running) return; state.list = state.list.filter(x => x !== r); renderTable(); };
     tr.querySelector('.run').onclick = () => guarded(async () => {
       if (r.state === 'eklendi' || r.state === 'dogrulandi') {
-        if (!confirm(`${r.kod} zaten eklenmiş görünüyor. Yine de yeniden eklensin mi?`)) return;
+        if (!confirm(`${r.kod || r.ad} zaten eklenmiş görünüyor. Yine de yeniden eklensin mi?`)) return;
       }
       await loop([r], addOne, 'Tek satır ekleme').catch(() => {});
     });
@@ -1075,7 +1260,7 @@
 
   function updateCounts() {
     const c = s => state.list.filter(r => r.state === s).length;
-    q('cnt').textContent = `Toplam ${state.list.length} · Bekleyen ${c('bekliyor')} · Eklendi ${c('eklendi')} · Doğrulandı ${c('dogrulandi')} · Hata ${c('hata')}`;
+    q('cnt').textContent = `Toplam ${state.list.length} · Bekleyen ${c('bekliyor')} · Eklendi ${c('eklendi')} · Doğrulandı ${c('dogrulandi')} · Hata ${c('hata')} · Atlandı ${c('atlandi')}`;
   }
   function updateStatus() {
     const ok = isProductie(), s = q('st');
@@ -1085,7 +1270,7 @@
   }
   function updateButtons() {
     const on = isProductie() && !state.running;
-    q('go').disabled = !on || !state.list.some(r => r.state === 'bekliyor' && r.kod && r.adet);
+    q('go').disabled = !on || !state.list.some(r => r.state === 'bekliyor' && (r.kod || r.ad) && r.adet);
     q('vall').disabled = !on;
     q('vunlock').disabled = !on;
     q('stop').disabled = !state.running;
@@ -1094,20 +1279,45 @@
 
   /* ================== DOSYA OKUMA ================== */
   function loadXLSX() {
-    return new Promise((res, rej) => {
-      if (window.XLSX) return res();
-      const s = document.createElement('script');
-      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
-      s.onload = () => window.XLSX ? res() : rej(new Error('XLSX yok'));
-      s.onerror = () => rej(new Error('SheetJS yüklenemedi'));
-      document.head.appendChild(s);
+    const urls = ['https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js', 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js'];
+    const tryLoad = u => new Promise((res, rej) => {
+      const el = document.createElement('script');
+      el.src = u;
+      el.onload = () => window.XLSX ? res() : rej(new Error('XLSX yok'));
+      el.onerror = () => rej(new Error('SheetJS yüklenemedi'));
+      document.head.appendChild(el);
     });
+    return (async () => {
+      if (window.XLSX) return;
+      let last = null;
+      for (const u of urls) { try { await tryLoad(u); return; } catch (e) { last = e; } }
+      throw last || new Error('SheetJS yüklenemedi');
+    })();
   }
   function parseText(txt) {
     const lines = txt.split(/\r?\n/).filter(l => l.trim());
     if (!lines.length) return [];
-    const d = lines[0].includes('\t') ? '\t' : (lines[0].includes(';') ? ';' : ',');
+    const cnt = ch => lines.reduce((n, l) => n + (l.includes(ch) ? 1 : 0), 0);
+    const d = cnt('\t') ? '\t' : ((cnt(';') && cnt(';') >= cnt(',')) ? ';' : ',');
     return lines.map(l => l.split(d).map(c => c.trim().replace(/^"|"$/g, '')));
+  }
+
+  // "Vanzari pe perioada" satış raporu: başlıkta "Denumire produs" + "Cantitate", üstte "De la: ... pana la ..."
+  function detectReport(rows) {
+    const low = x => String(x ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+    for (let i = 0; i < Math.min(rows.length, 60); i++) {
+      const cells = rows[i].map(low);
+      const nameCol = cells.indexOf('denumire produs'), qtyCol = cells.indexOf('cantitate');
+      if (nameCol < 0 || qtyCol < 0) continue;
+      let from = '', to = '';
+      for (let j = 0; j < i; j++) {
+        const m = rows[j].join(' ').match(/de la\W*(\d{1,2}[./]\d{1,2}[./]\d{4})\W+pana la\W*(\d{1,2}[./]\d{1,2}[./]\d{4})/i);
+        if (m) { from = toDate(m[1]); to = toDate(m[2]); break; }
+      }
+      const data = rows.slice(i + 1).filter(r => String(r[nameCol] ?? '').trim() && parseNum(r[qtyCol]) > 0);
+      return { rows: data, nameCol, qtyCol, from, to };
+    }
+    return null;
   }
 
   /* ================== ARAYÜZ ================== */
@@ -1122,7 +1332,7 @@
   root.innerHTML = `
   <style>
     *{box-sizing:border-box;font-family:"Segoe UI",Tahoma,Arial,sans-serif}
-    .p{width:560px;background:#efefef;color:#1a1a1a;border:1px solid #5a5a5a;box-shadow:3px 3px 0 rgba(0,0,0,.28);font-size:12px}
+    .p{width:660px;background:#efefef;color:#1a1a1a;border:1px solid #5a5a5a;box-shadow:3px 3px 0 rgba(0,0,0,.28);font-size:12px}
     .h{display:flex;align-items:center;gap:6px;padding:6px 10px;background:#2f3b45;color:#fff;font-weight:600;font-size:12.5px;letter-spacing:.2px;cursor:move;user-select:none}
     .h span{flex:1}.h button{background:none;border:0;color:#fff;font-size:15px;line-height:1;cursor:pointer;padding:0 5px}
     .h button:hover{background:#455563}
@@ -1148,9 +1358,9 @@
     table{border-collapse:collapse;width:100%;font-size:12px}
     th{position:sticky;top:0;background:#d9d9d9;text-align:left;padding:3px 5px;border:1px solid #a8a8a8;font-weight:600;z-index:1}
     td{border:1px solid #d0d0d0;padding:1px 3px}
-    td input.k,td input.n,td input.t{width:100%;border:1px solid transparent;background:transparent;border-radius:0;padding:2px 4px;font-size:12px;font-family:Consolas,"Courier New",monospace}
-    td input.k:hover,td input.n:hover,td input.t:hover{border-color:#b0b0b0}
-    td input.k:focus,td input.n:focus,td input.t:focus{outline:0;border-color:#1f4e79;background:#fff}
+    td input.k,td input.a2,td input.n,td input.t{width:100%;border:1px solid transparent;background:transparent;border-radius:0;padding:2px 4px;font-size:12px;font-family:Consolas,"Courier New",monospace}
+    td input.k:hover,td input.a2:hover,td input.n:hover,td input.t:hover{border-color:#b0b0b0}
+    td input.k:focus,td input.a2:focus,td input.n:focus,td input.t:focus{outline:0;border-color:#1f4e79;background:#fff}
     th.tt{width:92px}
     td.ix{color:#7a7a7a;width:26px;text-align:right}td.act{white-space:nowrap;width:1%}
     td.act button{border:0;background:none;cursor:pointer;font-size:11.5px;padding:1px 5px;color:#1f4e79;text-decoration:underline}
@@ -1159,6 +1369,7 @@
     .stc{font-size:11.5px;font-weight:600;color:#666}
     tr.st-calisiyor{background:#fff6d6}tr.st-calisiyor .stc{color:#8a5a00}
     tr.st-eklendi .stc{color:#1f4e79}tr.st-dogrulandi .stc{color:#2e6b3a}
+    tr.st-atlandi .stc{color:#7a7a7a;text-decoration:line-through}tr.st-atlandi td:first-child{border-left-color:#9a9a9a}
     tr.st-hata{background:#f8eeee}tr.st-hata .stc{color:#a12622}
     tr td:first-child{border-left:3px solid transparent}
     tr.st-calisiyor td:first-child{border-left-color:#d49a00}tr.st-eklendi td:first-child{border-left-color:#1f4e79}
@@ -1183,9 +1394,10 @@
       <div class="pane" id="paneA">
       <details open><summary>1) Veri yükle</summary>
         <div class="row" style="margin-top:6px"><input type="file" id="f" accept=".xlsx,.xls,.csv,.txt" class="g"></div>
-        <textarea id="paste" placeholder="veya Excel'den Kod + Adet sütunlarını kopyalayıp buraya yapıştır"></textarea>
+        <textarea id="paste" placeholder="veya Excel'den (Kod/Ad + Adet) ya da Satış raporunu (Vanzari pe perioada) kopyalayıp buraya yapıştır"></textarea>
         <div class="row" style="margin-top:6px">
-          <label>Kod <select id="cc">${opts(0)}</select></label>
+          <label>Kod <select id="cc"><option value="-1">yok</option>${opts(0)}</select></label>
+          <label>Ad <select id="nc"><option value="-1" selected>yok</option>${opts(-1)}</select></label>
           <label>Adet <select id="ac">${opts(1)}</select></label>
           <label>Tarih <select id="dc"><option value="-1">yok</option>${opts(2)}</select></label>
           <button class="s" id="swap" type="button">Yer değiştir</button>
@@ -1195,6 +1407,7 @@
         </div>
         <div class="row" style="margin-top:5px"><label>Varsayılan tarih <input type="date" id="dd"></label><span class="cnt">Satırda tarih yoksa bu kullanılır; ikisi de boşsa sistemin tarihi kalır.</span></div>
         <div class="cnt" id="rawinfo"></div>
+        <div class="row" style="margin-top:4px"><button class="s" id="nameclr" type="button">Ad önbelleğini temizle</button><span class="cnt" id="nameinfo"></span></div>
       </details>
       <div class="row">
         <b>2) Tablo</b><span class="g"></span>
@@ -1203,7 +1416,7 @@
         <button class="s" id="clrdone">Doğrulananları temizle</button>
         <button class="s" id="clr">Tümünü temizle</button>
       </div>
-      <div class="tw"><table><thead><tr><th><input type="checkbox" id="all"></th><th>#</th><th>Kod</th><th>Adet</th><th class="tt">Tarih</th><th>Durum</th><th></th></tr></thead><tbody id="tb"></tbody></table></div>
+      <div class="tw"><table><thead><tr><th><input type="checkbox" id="all"></th><th>#</th><th>Kod</th><th>Ad</th><th>Adet</th><th class="tt">Tarih</th><th>Durum</th><th></th></tr></thead><tbody id="tb"></tbody></table></div>
       <div class="cnt" id="cnt"></div>
       <div class="row"><button class="a" id="go" title="Bekleyen satırları ekler, Alt+S ile kaydeder, Validate eder">Başlat</button></div>
       </div>
@@ -1214,7 +1427,7 @@
           <label><input type="radio" name="vm" value="one"> Tek tarih <input type="date" id="v1"></label>
           <label><input type="radio" name="vm" value="range"> Tarih aralığı <input type="date" id="v2"> <span>–</span> <input type="date" id="v3"></label>
           <label><input type="checkbox" id="vbump"> Önce Adet'i artır: <input type="number" id="vstep" value="1" step="any" style="width:56px"> (Modific, Alt+S, sonra Validate)</label>
-          <span class="cnt">Adet artırma sadece tek tarih / tarih aralığında çalışır; her kayıt yalnızca bir kez artırılır. <button class="s" id="vbumpclr" type="button">Artış kaydını sıfırla</button></span>
+          <span class="cnt">Adet artırma sadece tek tarih / tarih aralığında çalışır; her kayıt yalnızca bir kez artırılır. <button class="s" id="vbumpclr" type="button">Artış kaydını sıfırla</button> <button class="s" id="vjobclr" type="button">Yarım işi sıfırla</button></span>
           <span class="cnt">Sadece ana listede kilidi açık kayıtlar işlenir; kilitli (validate edilmiş) olanlara dokunulmaz. Tarih, ana listedeki Data sütunundan okunur.</span>
         </div>
         <div class="row">
@@ -1244,6 +1457,21 @@
     console.log('[SAGA]', m);
   }
 
+  // Okunan ham veriyi işle: satış raporu ise sütunları/tarihi otomatik ayarla
+  function applyRaw() {
+    const rep = detectReport(state.raw);
+    if (!rep) { q('rawinfo').textContent = state.raw.length ? `${state.raw.length} ham satır hazır` : ''; return; }
+    state.raw = rep.rows;
+    q('cc').value = '-1'; q('nc').value = String(rep.nameCol); q('ac').value = String(rep.qtyCol); q('dc').value = '-1';
+    q('hdr').checked = false;
+    const single = rep.from && rep.from === rep.to;
+    if (single) { const [d, m, y] = rep.from.split('.'); q('dd').value = `${y}-${m}-${d}`; q('dd').onchange && q('dd').onchange(); }
+    const when = !rep.from ? 'tarih bulunamadı' : (single ? rep.from : `${rep.from} - ${rep.to}`);
+    q('rawinfo').textContent = `Satış raporu algılandı: ${rep.rows.length} ürün, ${when}`;
+    log(`Satış raporu algılandı: ${rep.rows.length} ürün, tarih ${when}. Kontrol edip "Tabloya aktar"a bas.`, 'good');
+    if (rep.from && !single) log('Rapor birden fazla günü kapsıyor: varsayılan tarihi kendin seç (yoksa sistem tarihi kullanılır).', 'warn');
+  }
+
   async function readFile(file) {
     try {
       if (/\.(csv|txt)$/i.test(file.name)) state.raw = parseText(await file.text());
@@ -1252,35 +1480,42 @@
         const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
         state.raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '' });
       }
-      log(`${file.name} okundu: ${state.raw.length} satır. Sütunları seçip "Tabloya aktar"a bas.`, 'good');
+      log(`${file.name} okundu: ${state.raw.length} satır`, 'good');
+      applyRaw();
     } catch (err) {
-      log('Dosya okunamadı: ' + err.message + ' (CSV yükle ya da yapıştır)', 'err');
+      log('Dosya okunamadı: ' + err.message + " (sayfa güvenliği SheetJS'i engelliyor olabilir: Excel'den hücreleri kopyalayıp yapıştırma kutusuna yapıştır)", 'err');
     }
-    q('rawinfo').textContent = state.raw.length ? `${state.raw.length} ham satır hazır` : '';
   }
 
   q('f').addEventListener('change', e => e.target.files[0] && readFile(e.target.files[0]));
-  q('paste').addEventListener('input', () => { state.raw = parseText(q('paste').value); q('rawinfo').textContent = `${state.raw.length} ham satır hazır`; });
+  q('paste').addEventListener('input', () => { state.raw = parseText(q('paste').value); applyRaw(); });
   q('swap').onclick = () => { const a = q('cc').value; q('cc').value = q('ac').value; q('ac').value = a; };
   q('imp').onclick = () => {
-    const ci = +q('cc').value, ai = +q('ac').value, di = +q('dc').value;
-    let n = 0, bad = 0;
+    const ci = +q('cc').value, ni = +q('nc').value, ai = +q('ac').value, di = +q('dc').value;
+    if (ci < 0 && ni < 0) return log('[HATA] Kod veya Ad sütunlarından en az biri seçilmeli', 'err');
+    if (ai < 0) return log('[HATA] Adet sütunu seçilmeli', 'err');
+    let n = 0, bad = 0, skip = 0;
     state.raw.slice(q('hdr').checked ? 1 : 0).forEach(r => {
-      const kod = String(r[ci] ?? '').trim();
+      const kod = ci >= 0 ? String(r[ci] ?? '').trim() : '';
+      const ad = ni >= 0 ? String(r[ni] ?? '').replace(/\s+/g, ' ').trim() : '';
       let a = r[ai];
       if (typeof a === 'number') a = String(Math.round(a * 10000) / 10000);
       a = String(a ?? '').trim();
+      if (!(kod || ad) || !(parseNum(a) > 0)) { skip++; return; }
       let t = '';
       if (di >= 0 && r[di] !== '' && r[di] != null) {
         t = toDate(r[di]);
         if (!t) { bad++; t = String(r[di]).trim(); }       // anlaşılmayanı olduğu gibi göster, kullanıcı düzeltsin
       }
-      if (kod && a) { state.list.push(newRow(kod, a, t)); n++; }
+      state.list.push(newRow(kod, a, t, ad)); n++;
     });
     renderTable();
-    log(`${n} satır tabloya eklendi`, 'good');
+    log(`${n} satır tabloya eklendi` + (skip ? ` (${skip} boş/sıfır satır atlandı)` : ''), 'good');
     if (bad) log(`${bad} satırda tarih anlaşılamadı (tabloda düzeltebilirsin; boş bırakırsan varsayılan/sistem tarihi kullanılır)`, 'warn');
   };
+  const refreshNameInfo = () => { q('nameinfo').textContent = `Önbellekte ${Object.keys(nameMap).length} ürün adı`; };
+  q('nameclr').onclick = () => { nameMap = {}; saveNames(); refreshNameInfo(); log('Ad önbelleği temizlendi', 'warn'); };
+
   q('addrow').onclick = () => { state.list.push(newRow('', '')); renderTable(); const ks = root.querySelectorAll('.k'); ks[ks.length - 1] && ks[ks.length - 1].focus(); };
   q('delsel').onclick = () => { state.list = state.list.filter(r => !r.sel); renderTable(); };
   q('clrdone').onclick = () => { state.list = state.list.filter(r => r.state !== 'dogrulandi'); renderTable(); };
@@ -1308,10 +1543,11 @@
       if (ex) log(`   kilitli satır ikonu: class="${ex.className}" data-value="${ex.dataset.value}"`);
     } catch (e) { q('vinfo').textContent = e.message; }
   };
+  q('vjobclr').onclick = () => { clearJob(); log('Yarım kalan iş kaydı silindi', 'warn'); };
   q('vbumpclr').onclick = () => { try { localStorage.removeItem(BUMP_KEY); } catch (e) {} log('Artış kaydı sıfırlandı', 'warn'); };
   q('mn').onclick = () => q('p').classList.toggle('min');
   q('stop').onclick = () => { state.stop = true; log('Durdurma istendi…', 'warn'); };
-  q('go').onclick = () => guarded(() => loop(state.list.filter(r => r.state === 'bekliyor' && r.kod && r.adet), addOne, 'Ekleme'));
+  q('go').onclick = () => guarded(() => loop(state.list.filter(r => r.state === 'bekliyor' && (r.kod || r.ad) && r.adet), addOne, 'Ekleme'));
   q('vall').onclick = () => guarded(() => validateAllPage().catch(e => {
     if (e.message === 'STOP') log('Durduruldu', 'warn'); else log('[HATA] ' + e.message, 'err');
   }));
@@ -1331,7 +1567,7 @@
   q('cl').onclick = destroy;
   window.__sagaProd = { destroy, CFG, state };
 
-  restore(); renderTable(); updateStatus();
+  restore(); renderTable(); updateStatus(); refreshNameInfo();
   log('Sürüm ' + VERSION + ' yüklendi. Üstte Ekle / Validate sekmeleri var.', 'good');
   log('Hazır. Veriyi yükle → Tabloya aktar → Başlat. Daha önce eklenenler için Validate All.');
 })();
