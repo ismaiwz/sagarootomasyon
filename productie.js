@@ -42,6 +42,7 @@
       { re: /prestabilit/i, btn: '#buttonChooseYes', label: 'Da (Enter)' },
       { re: /devalid/i, btn: '#buttonChooseYes', label: 'Da' },
       { re: /renun/i, btn: '#buttonChooseYes', label: 'Da' },                   // Renunt (vazgeç) onay sorusu                // Devalidez onay sorusu
+            { re: /actualizarea consumurilor/i, btn: '#buttonChooseYes', label: 'Da' }, // Adet değişince reçete tüketimlerini güncelleme onayı
       // "Se incearca descarcarea unei intrari posterioare datei documentului. ... Continuam?" -> Da (toate), yoksa Da
       { re: /posterioare datei/i, btn: ['#buttonChooseYesAll', '#buttonChooseYes'], label: 'Da (toate)', enter: false, collect: true },   // "Sunteti sigur ca nu doriti completarea pretului prestabilit?"
     ],
