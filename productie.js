@@ -1204,6 +1204,8 @@ const okFn = ctx ? () => rowLocked(ctx) : null;
 
 let wait = CFG.ms.validateWait;
 
+let savedAfterSilentFailure = false;
+
 for (let n = 1; n <= CFG.maxValidateRounds; n++) {
 
 checkStop();
@@ -1222,6 +1224,32 @@ const md = $$('.modal, [role="dialog"]').filter(visible).map(x => x.textContent.
 
 log(' Validate kilitlemedi ve uyarı vermedi' + (md ? '; ekranda pencere var: ' + md.slice(0, 120) : ''), 'warn');
 
+if (!savedAfterSilentFailure) {
+
+savedAfterSilentFailure = true;
+
+log(' sessiz Validate başarısız; önce kayıt yapılıyor, ardından aynı satırda bir kez daha Validate denenecek', 'warn');
+
+await saveRecord();
+
+const saveWarning = await waitFor(warnVisible, 1200, 100);
+
+if (saveWarning) {
+
+const saveText = (saveWarning.innerText || saveWarning.textContent || '').replace(/\s+/g, ' ').trim();
+
+await dismissModal(saveWarning);
+
+throw skipErr('Validate sonrası kayıt da başarısız; bu satır atlanıyor: ' + saveText);
+
+}
+
+await sleep(CFG.ms.afterSave);
+
+continue;
+
+}
+
 if (CFG.deletePosterior && postSeen.length) {
 
 log(' Onay sorusundaki kalem(ler) detaydan siliniyor: ' + postSeen.map(x => x.name || x.code || '?').join(', '), 'warn');
@@ -1237,6 +1265,8 @@ wait = CFG.ms.validateWaitAfterDelete;
 continue;
 
 }
+
+if (savedAfterSilentFailure) throw skipErr('Save sonrası Validate yine kilitlemedi; sonraki satıra geçiliyor');
 
 return n;
 
@@ -1440,7 +1470,11 @@ log(' satır seçilemedi, tekrar deneniyor', 'warn');
 
 }
 
-throw terr('Satır seçilemedi, yanlış kayda Validate basılmaması için durdum');
+key('Escape', {}, document.body);
+
+await sleep(300);
+
+throw terr('Satır seçilemedi; Escape gönderildi, yanlış kayda Validate basılmadı');
 
 }
 
