@@ -1,7 +1,7 @@
 
 (() => {
   'use strict';
-  const VERSION = 'v5.0 · rapor, ad ile bulma, devam';
+  const VERSION = 'v6.1 · iaydinlik';
   if (window.__sagaProd) { try { window.__sagaProd.destroy(); } catch (e) {} }
 
   /* ================== AYARLAR ================== */
@@ -30,6 +30,8 @@
     fixPrice: true,           // Validate bitince CONSUMURI nihai değerine ulaşır; VALOARE ≠ CONSUMURI ise: Devalidez -> PRET = CONSUMURI / CANTITATE -> Alt+S -> tekrar Validate
     verifyLock: true,         // Validate sonrası satırın kilidinin kapandığını kontrol et (grid canlı güncellenmiyorsa false yap)
     confirmValidateAll: true, // Validate All başlamadan önce onay sor (false: sormadan başla)
+    pauseOnUnknown: true,     // bilinmeyen Da/Nu sorusunda hata verme: loga yaz, elle cevaplanmasını bekle (en çok 10 dk), sonra devam et
+    bigJob: 100,              // bu kadar kayıttan fazlası bulunursa başlamadan önce onay sor
     retries: 2,               // geçici hatalarda (satır bulunamadı vb.) kayıt başına yeniden deneme
     scanMs: 180000,           // tek bir tarama için en çok süre (takılmayı önler)
     stopOnError: true,       // bir satır hata verirse tüm işlem dursun
@@ -37,12 +39,13 @@
     // Uyarıdaki: "...la articolul PRAF DE COPT (90000005) este mai mare..." -> 1. grup ad, 2. grup kod
     warnRegex: /articolul\s+(.+)\s+\(([^()]+)\)/i,
     // Kayıt/validate sırasında çıkabilen Da/Nu onay penceresi (#textChoice). Metin eşleşirse btn tıklanır.
-    // Burada olmayan bir soru çıkarsa script dokunmadan durur ve metni loga yazar.
+    // Burada olmayan bir soru çıkarsa script cevaplamaz: soruyu loga yazar ve sen elle cevaplayana kadar bekler (pauseOnUnknown).
     confirms: [
       { re: /prestabilit/i, btn: '#buttonChooseYes', label: 'Da (Enter)' },
-      { re: /devalid/i, btn: '#buttonChooseYes', label: 'Da' },
-      { re: /renun/i, btn: '#buttonChooseYes', label: 'Da' },                   // Renunt (vazgeç) onay sorusu                // Devalidez onay sorusu
-            { re: /actualizarea consumurilor/i, btn: '#buttonChooseYes', label: 'Da' }, // Adet değişince reçete tüketimlerini güncelleme onayı
+      { re: /devalid/i, btn: '#buttonChooseYes', label: 'Da' },                    // Devalidez onay sorusu
+      { re: /renun/i, btn: '#buttonChooseYes', label: 'Da' },                   // Renunt (vazgeç) onay sorusu
+      // Adet değişince kayıtta çıkar: "Cantitatea a fost modificata la produsul X. Doriti actualizarea consumurilor conform retetei?" -> Da
+      { re: /actualizarea consumurilor/i, btn: '#buttonChooseYes', label: 'Da (tüketimler reçeteye göre güncellensin)' },
       // "Se incearca descarcarea unei intrari posterioare datei documentului. ... Continuam?" -> Da (toate), yoksa Da
       { re: /posterioare datei/i, btn: ['#buttonChooseYesAll', '#buttonChooseYes'], label: 'Da (toate)', enter: false, collect: true },   // "Sunteti sigur ca nu doriti completarea pretului prestabilit?"
     ],
@@ -102,11 +105,16 @@
   function harvestNames() { try { mainRows().forEach(r => learnName(fieldText(r, 'DENUMIRE'), fieldText(r, 'COD'))); } catch (e) {} }
 
   const KEYS = { Enter: 13, Escape: 27, Delete: 46, Tab: 9, ArrowDown: 40 };
+  const PUNCT = { '.': [190, 'Period'], ',': [188, 'Comma'], '-': [189, 'Minus'], '_': [189, 'Minus'], '/': [191, 'Slash'], ' ': [32, 'Space'], ':': [186, 'Semicolon'], ';': [186, 'Semicolon'], '+': [187, 'Equal'], '(': [57, 'Digit9'], ')': [48, 'Digit0'], '*': [56, 'Digit8'], "'": [222, 'Quote'], '"': [222, 'Quote'] };
   function key(k, opt = {}, target) {
     let t = target || document.activeElement || document.body;
     if (t === host || (host && host.contains(t))) t = document.body;
-    const kc = KEYS[k] || (k.length === 1 ? k.toUpperCase().charCodeAt(0) : 0);
-    const code = k.length === 1 ? 'Key' + k.toUpperCase() : k;
+    // Gerçek klavye kodları: '.' = 190 (46 DELETE'tir!), ',' = 188, '-' = 189, '(' = Shift+9 ...
+    let kc = 0, code = 'Unidentified';
+    if (KEYS[k]) { kc = KEYS[k]; code = k; }
+    else if (/^[a-z]$/i.test(k)) { kc = k.toUpperCase().charCodeAt(0); code = 'Key' + k.toUpperCase(); }
+    else if (/^[0-9]$/.test(k)) { kc = k.charCodeAt(0); code = 'Digit' + k; }
+    else if (PUNCT[k]) { kc = PUNCT[k][0]; code = PUNCT[k][1]; }
     ['keydown', 'keypress', 'keyup'].forEach(type => {
       const ev = new KeyboardEvent(type, { key: k, code, bubbles: true, cancelable: true, ...opt });
       Object.defineProperty(ev, 'keyCode', { get: () => kc });
@@ -194,19 +202,32 @@
     const c = choiceVisible();
     if (!c) return false;
     const text = c.textContent.replace(/\s+/g, ' ').trim();
-    const rule = CFG.confirms.find(x => x.re.test(text));
-    if (!rule) throw new Error('Bilinmeyen onay penceresi, dokunmadım: ' + text.slice(0, 160));
-    const btn = [].concat(rule.btn).map(x => $(x)).find(b => b && visible(b));   // ilk GÖRÜNÜR buton
-    if (!btn) throw new Error('Onay butonu bulunamadı: ' + [].concat(rule.btn).join(' / '));
-    log(`   onay: "${text.replace(/\s+/g, ' ').slice(0, 90)}" -> ${rule.label}`, 'warn');
-    if (rule.collect) {
-      const lines = String(c.innerText || c.textContent).split(/\n/).map(x => x.trim()).filter(Boolean);
-      let name = '', code = '';
-      for (const ln of lines) { const m = ln.match(/^(.+?)\s*\(([^()]+)\)\s*$/); if (m) { name = m[1]; code = m[2]; break; } }
-      postSeen.push({ name, code, raw: text });
+    if (/stergerea inregistrarii/i.test(text)) {          // "Stergere: ... stergerea inregistrarii curente?"
+      const box0 = c.closest('.modal-content, .modal, [role="dialog"]') || document;
+      const want = state.deleting ? /^\W*sterge\W*$/i : /^\W*(anuleaza|nu)\W*$/i;   // bizim detay silmemiz değilse İPTAL
+      const b0 = $$('button, .btn, [role="button"]', box0).find(b => visible(b) && want.test(b.textContent.trim()));
+      if (b0) { b0.click(); await waitFor(() => !visible(c), 1500, 100); }
+      if (!state.deleting) throw terr('Beklenmeyen silme sorusu İPTAL edildi (kayıt silinmedi)');
+      return true;
     }
-    if (rule.enter !== false) key('Enter', {}, btn);          // önce Enter (Da zaten odakta)
-    if (rule.enter === false || !(await waitFor(() => !visible(c), 800, 100))) {   // kapanmadıysa / Enter istenmiyorsa butona tıkla
+    const rule = CFG.confirms.find(x => x.re.test(text));
+    if (!rule) {
+      if (!CFG.pauseOnUnknown) throw new Error('Bilinmeyen onay penceresi, dokunmadım: ' + text.slice(0, 160));
+      log('   BİLİNMEYEN SORU (elle cevapla, bekliyorum): ' + text.slice(0, 200), 'err');
+      const gone = await waitFor(() => !visible(c), 600000, 300);
+      if (!gone) throw new Error('Bilinmeyen onay penceresi 10 dk cevaplanmadı: ' + text.slice(0, 160));
+      log('   soru cevaplandı, devam ediliyor', 'good');
+      await sleep(500);
+      return true;
+    }
+    const box = c.closest('.modal-content, .modal, [role="dialog"]') || document;
+    let btn = null;
+    if (rule.btnText) btn = $$('button, .btn, [role="button"]', box).find(b => visible(b) && rule.btnText.test(b.textContent.trim()));
+    if (!btn) btn = [].concat(rule.btn || []).map(x => $(x)).find(b => b && visible(b));   // ilk GÖRÜNÜR buton
+    if (!btn) throw new Error('Onay butonu bulunamadı: ' + [].concat(rule.btn || []).join(' / ') + (rule.btnText ? ' / ' + rule.btnText : ''));
+    log(`   onay: "${text.slice(0, 90)}" -> ${rule.label}`, 'warn');
+    if (rule.enter !== false && !rule.btnText) key('Enter', {}, btn);   // önce Enter (Da zaten odakta)
+    if (rule.enter === false || rule.btnText || !(await waitFor(() => !visible(c), 800, 100))) {   // kapanmadıysa / Enter istenmiyorsa butona tıkla
       btn.click();
       await waitFor(() => !visible(c), 1500, 100);
     }
@@ -217,12 +238,26 @@
   const isEnabled = el => !!el && visible(el) && !el.disabled && !el.hasAttribute('disabled') && !/\bdisabled\b/i.test(el.className || '');
 
   // Alt+S: kayıt gerçekten bitene kadar bekler, çıkan onay pencerelerini cevaplar
+  // Kendi detay silmemiz dışında ekranda "Anuleaza" butonlu (silme vb.) bir pencere varsa İPTAL et ve hata ver:
+  // script körlemesine devam edip yanlış yere tıklamasın.
+  async function handleStray() {
+    if (state.deleting) return;
+    const b = findDialogButton(/^\W*anuleaza\W*$/i);
+    if (!b) return;
+    const box = b.closest('.modal-content, .modal, [role="dialog"]');
+    const text = box ? box.textContent.replace(/\s+/g, ' ').trim().slice(0, 140) : '';
+    log('   BEKLENMEYEN pencere iptal ediliyor (Anuleaza): ' + text, 'err');
+    b.click();
+    await sleep(500);
+  }
+
   async function saveRecord() {
     const b = $(CFG.sel.save);
     if (b) b.click(); else key('s', { altKey: true }, document.body);
     const t0 = Date.now();
     while (Date.now() - t0 < CFG.ms.saveWait) {
       checkStop();
+      await handleStray();
       if (await handleChoice()) continue;
       if (warnVisible()) return;                              // kayıt hatası, çağıran işler
       if (!isEnabled($(CFG.sel.save))) {                      // Kaydet pasifleşti = kayıt bitti
@@ -442,6 +477,7 @@
     let t0 = Date.now();
     while (Date.now() - t0 < wait) {
       checkStop();
+      await handleStray();
       const w = warnVisible();
       if (w) return w;                                      // önce silinecek (stok) uyarısı varsa o işlensin
       if (await handleChoice()) { t0 = Date.now(); wait = Math.max(wait, CFG.ms.afterChoiceWait); continue; }   // sonra Da (toate)
@@ -504,16 +540,28 @@
     return hit;
   }
 
+  const findDialogButton = rx => $$('button, .btn, [role="button"]').find(b => visible(b) && !host.contains(b) && rx.test(b.textContent.trim()));
+
   async function deleteDetailRow(hit) {
+    if (isEnabled($(CFG.sel.save))) {                      // ana kayıt düzenleme modundayken Delete tuşu ANA kaydı silme sorusu açar
+      await cancelEdit();
+      if (isEnabled($(CFG.sel.save))) throw terr('Ana kayıt düzenleme modunda: silme yapılmadı');
+    }
     const before = detailRows().length;
     const cell = $$('td, [role="gridcell"]', hit.row)[2] || $('td, [role="gridcell"]', hit.row) || hit.row;
-    clickEl(cell);
-    await sleep(300);
-    key('Delete', {}, cell);
-    await sleep(CFG.ms.step);
-    key('Enter', {}, document.body);
-    const done = await waitFor(() => detailRows().length < before, 2500, 100);
-    if (!done) throw new Error('Silme çalışmadı (satır sayısı azalmadı)');
+    state.deleting = true;
+    try {
+      clickEl(cell);
+      await sleep(300);
+      key('Delete', {}, cell);
+      await sleep(CFG.ms.step);
+      // silme onayı: "Stergere - Sunteti sigur ca doriti stergerea inregistrarii curente?" -> Sterge (Anuleaza değil)
+      const dlg = await waitFor(() => findDialogButton(/^\W*sterge\W*$/i), 2500, 100);
+      if (dlg) { dlg.click(); await sleep(300); }
+      else key('Enter', {}, document.body);
+      const done = await waitFor(() => detailRows().length < before, 2500, 100);
+      if (!done) throw new Error('Silme çalışmadı (satır sayısı azalmadı)');
+    } finally { state.deleting = false; }
   }
 
   async function findInDetail(item) {
@@ -719,7 +767,7 @@
     if (sw) {
       const t = (sw.innerText || sw.textContent || '').replace(/\s+/g, ' ').trim();
       await dismissModal(sw);
-      throw new Error('Fiyat kaydedilemedi: ' + t);
+      throw terr('Fiyat kaydedilemedi: ' + t);
     }
   }
 
@@ -857,7 +905,7 @@
     if (sw) {
       const t = (sw.innerText || sw.textContent || '').replace(/\s+/g, ' ').trim();
       await dismissModal(sw);
-      throw new Error('Adet kaydedilemedi: ' + t);
+      throw terr('Adet kaydedilemedi: ' + t);
     }
   }
 
@@ -982,6 +1030,7 @@
 
   // Toplu iş: tara -> sırayla işle. Her biten kayıt kalıcı olarak işaretlenir; yarım kalırsa kaldığı yerden devam eder.
   async function batchRun({ kind, fkey, f, locked, title, processItem }) {
+    await recover().catch(() => {});
     let job = loadJob(), resumeList = null;
     if (job && job.fkey === fkey) {
       const remain = job.items.filter(it => !job.done.includes(it.id));
@@ -1005,6 +1054,7 @@
         saveJob(job);
       }
       if (!list.length) { log(round === 1 ? 'Filtreye uyan kayıt yok' : 'Kalan kayıt yok', 'good'); break; }
+      if (round === 1 && !resumeList && list.length > CFG.bigJob && !confirm(`${list.length} kayıt bulundu.\nHepsi işlenecek (uzun sürebilir; yarım kalırsa kaldığı yerden devam edilebilir).\nDevam edilsin mi?`)) { log('İptal edildi (tarama kaydedildi)', 'warn'); return; }
       log(`${list.length} kayıt bulundu, bu sırayla işlenecek:`, 'good');
       list.slice(0, 40).forEach((it, i) => log(`   ${i + 1}. ${it.label}`));
       if (list.length > 40) log(`   … ve ${list.length - 40} kayıt daha`);
@@ -1022,6 +1072,7 @@
           if (err.message === 'STOP') throw err;
           fail++; failed.add(it.id);
           log(`[HATA] [${i + 1}/${list.length}] ${it.label}: ${err.message}`, 'err');
+          try { await recover(); } catch (e2) {}               // sayfayı temiz duruma getir (açık form / pencere)
           if (CFG.stopOnError) break outer;
         }
       }
@@ -1078,7 +1129,13 @@
         if (!isUnlocked(getRow(ctxOf(row)) || row)) { log('   kilitli, düzenleme ve validate atlandı', 'warn'); return 'skip'; }
         if (bump) {
           if (bumped.has(it.id)) log('   adet daha önce artırılmış, sadece validate', 'warn');
-          else { await bumpQuantity(bump); bumped.add(it.id); saveBumped(bumped); }
+          else {
+            const cur = parseNum(fieldText(getRow(ctxOf(row)) || row, 'CANTITATE'));
+            if (it.bumpFrom === undefined) it.bumpFrom = cur;          // ilk denemedeki adet
+            if (Math.abs(cur - (it.bumpFrom + bump)) < 1e-6) log('   adet zaten artırılmış görünüyor (önceki deneme kaydetmiş), tekrar artırılmıyor', 'warn');
+            else await bumpQuantity(bump);
+            bumped.add(it.id); saveBumped(bumped);
+          }
         }
         const ctx = ctxOf(getRow(ctxOf(row)) || row);
         const t = await validateCycle(ctx);
@@ -1148,6 +1205,8 @@
   // Geçici hata sonrası sayfayı sakin bir duruma getir (açık form varsa kapat, internet bekle)
   async function recover() {
     await waitOnline();
+    try { await handleStray(); } catch (e) {}              // beklenmeyen silme penceresi varsa iptal et
+    try { const w = warnVisible(); if (w) await dismissModal(w); } catch (e) {}
     try { if (isEnabled($(CFG.sel.save))) await cancelEdit(); } catch (e) {}
     await sleep(1000);
   }
