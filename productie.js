@@ -504,7 +504,24 @@
     if (ok) ok.click();
     await waitFor(closed, 1500, 100);
   }
+const isValidatedDeleteWarn = t => /stergerea nu s-a putut efectua|nu puteti sterge un document validat/i.test(norm(t));
 
+  async function handleValidatedDeleteWarn(w, alreadyDismissed = false) {
+    const text = w ? (w.innerText || w.textContent || '') : '';
+    if (w && !isValidatedDeleteWarn(text)) return false;
+    log('   "Document validat" silme hatası -> OK, Alt+V, Alt+D yapılıyor…', 'warn');
+    if (w && !alreadyDismissed) {
+      await dismissModal(w);
+      await sleep(400);
+    }
+    key('v', { altKey: true }, document.body);
+    await sleep(600);
+    if (await handleChoice()) await sleep(400);
+    key('d', { altKey: true }, document.body);
+    await sleep(600);
+    if (await handleChoice()) await sleep(400);
+    return true;
+  }
   // Ardışık çıkan tüm uyarılara OK der, hepsinin bilgisini toplar
   async function collectWarnings(first) {
     const items = [];
@@ -559,8 +576,10 @@
       const dlg = await waitFor(() => findDialogButton(/^\W*sterge\W*$/i), 2500, 100);
       if (dlg) { dlg.click(); await sleep(300); }
       else key('Enter', {}, document.body);
-      const done = await waitFor(() => detailRows().length < before, 2500, 100);
-      if (!done) throw new Error('Silme çalışmadı (satır sayısı azalmadı)');
+      const done = await waitFor(() => detailRows().length < before || warnVisible(), 2500, 100);
+      const w = warnVisible();
+      if (w && await handleValidatedDeleteWarn(w)) return;
+      if (!done || detailRows().length >= before) throw new Error('Silme çalışmadı (satır sayısı azalmadı)');
     } finally { state.deleting = false; }
   }
 
