@@ -23,18 +23,18 @@
       afterAdd: 900, typeChar: 25, afterCode: 1200, afterQty: 300,
       afterSave: 1500, saveWait: 5000, validateWait: 5000, validateWaitAfterDelete: 8000, step: 450, afterSelect: 500, afterChoiceWait: 15000,
     },
-    maxValidateRounds: 40,   // bir kayıt için en fazla Validate turu
+    maxValidateRounds: 100,   // bir kayıt için en fazla Validate turu
     clearNr: true,            // kayıttan hemen önce Nr. doc alanında bir şey yazıyorsa temizle
     deletePosterior: true,    // "posterioare datei" sorusundaki kalem, Da(toate)'ten sonra da kilit kapanmazsa detaydan silinir
     priceAdjust: false,       // true: PRET'i bölme sonucunun ±3 binde birinde VALOARE'yi en iyi eşitleyecek şekilde seç (varsayılan: düz CONSUMURI / CANTITATE)
     fixPrice: true,           // Validate bitince CONSUMURI nihai değerine ulaşır; VALOARE ≠ CONSUMURI ise: Devalidez -> PRET = CONSUMURI / CANTITATE -> Alt+S -> tekrar Validate
-    verifyLock: false,         // Validate sonrası satırın kilidinin kapandığını kontrol et (grid canlı güncellenmiyorsa false yap)
+    verifyLock: true,         // Validate sonrası satırın kilidinin kapandığını kontrol et (grid canlı güncellenmiyorsa false yap)
     confirmValidateAll: true, // Validate All başlamadan önce onay sor (false: sormadan başla)
     pauseOnUnknown: true,     // bilinmeyen Da/Nu sorusunda hata verme: loga yaz, elle cevaplanmasını bekle (en çok 10 dk), sonra devam et
     bigJob: 100,              // bu kadar kayıttan fazlası bulunursa başlamadan önce onay sor
     retries: 2,               // geçici hatalarda (satır bulunamadı vb.) kayıt başına yeniden deneme
     scanMs: 180000,           // tek bir tarama için en çok süre (takılmayı önler)
-    stopOnError: true,       // bir satır hata verirse tüm işlem dursun
+    stopOnError: false,       // bir satır hata verirse tüm işlem dursun
     decimalComma: false,     // true: 2.5 -> "2,5"
     // Uyarıdaki: "...la articolul PRAF DE COPT (90000005) este mai mare..." -> 1. grup ad, 2. grup kod
     warnRegex: /articolul\s+(.+)\s+\(([^()]+)\)/i,
