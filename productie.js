@@ -1432,13 +1432,9 @@ const sels = mainRows().filter(x => SELECT_CLS.test(x.className.replace(/rowSele
 
 if (!sels.length) {
 
-if (i === 0) log(' (seçili satır sınıfı tanınmadı, doğrulanamadı: class="' + find().className + '")', 'warn');
+if (i === 0) log(' (seçili satır sınıfı tanınmadı; seçimi doğrulamak için yeniden denenecek: class="' + find().className + '")', 'warn');
 
-return;
-
-}
-
-if (sels.some(x => rowSig(x) === id)) return;
+} else if (sels.some(x => rowSig(x) === id)) return;
 
 log(' satır seçilemedi, tekrar deneniyor', 'warn');
 
@@ -1760,7 +1756,7 @@ return m[2] === ',' ? out.replace('.', ',') : out;
 
 // Her kaydın adedi yalnızca BİR kez artırılsın (hata sonrası tekrar çalıştırmada üst üste eklenmesin)
 
-const BUMP_KEY = '__sagaProdBumped';
+const BUMP_KEY = '__sagaProdBumped_v6_1';
 
 const loadBumped = () => { try { return new Set(JSON.parse(localStorage.getItem(BUMP_KEY) || '[]')); } catch (e) { return new Set(); } };
 
@@ -1770,7 +1766,7 @@ const saveBumped = set => { try { localStorage.setItem(BUMP_KEY, JSON.stringify(
 
 // Seçili ana liste kaydını Modific ile açar, Adet'i artırır, Alt+S ile kaydeder
 
-async function bumpQuantity(step) {
+async function bumpQuantity(step, ctx = null) {
 
 const editBtn = $$('#toolbarCRUD_Productie button').find(b => visible(b) && /modific/i.test(b.textContent));
 
@@ -1809,6 +1805,78 @@ if (sw) {
 const t = (sw.innerText || sw.textContent || '').replace(/\s+/g, ' ').trim();
 
 await dismissModal(sw);
+
+if (/nu puteti modifica un document validat/i.test(norm(t))) {
+
+if (!ctx) throw new Error('Doğrulanmış belge uyarısı: aynı satır bağlamı bulunamadı');
+
+log(' Belge doğrulanmış uyarısı: OK kapatıldı; aynı satırda Validate → Devalidez kurtarması uygulanıyor', 'warn');
+
+await cancelEdit();
+
+let row = getRow(ctx);
+
+if (!row) throw terr('Doğrulanmış belge kurtarması: aynı satır artık bulunamıyor');
+
+await selectMainRow(row);
+
+row = getRow(ctx);
+
+if (!row) throw terr('Doğrulanmış belge kurtarması: seçilen satır kayboldu');
+
+if (isUnlocked(row)) {
+
+const validated = await runValidate(CFG.ms.validateWait, () => { const current = getRow(ctx); return !!current && !isUnlocked(current); });
+
+if (!validated) throw terr('Kurtarma için Validate tamamlanmadı');
+
+await verifyLocked(ctx);
+
+}
+
+await devalidate(ctx);
+
+row = getRow(ctx);
+
+if (!row) throw terr('Devalide sonrası aynı satır bulunamadı');
+
+await selectMainRow(row);
+
+const editAgain = $$('#toolbarCRUD_Productie button').find(b => visible(b) && /modific/i.test(b.textContent));
+
+if (!editAgain || !isEnabled(editAgain)) throw terr('Devalide sonrası Modific açılamadı');
+
+editAgain.click();
+
+const retryQty = await waitFor(() => { const x = $(CFG.sel.qty); return visible(x) ? x : null; }, 6000);
+
+if (!retryQty) throw terr('Devalide sonrası Adet alanı açılmadı');
+
+retryQty.focus(); retryQty.select && retryQty.select();
+
+setVal(retryQty, nu);
+
+retryQty.dispatchEvent(new Event('change', { bubbles: true }));
+
+await sleep(CFG.ms.afterQty);
+
+await saveRecord();
+
+const retryWarning = await waitFor(warnVisible, 1200, 100);
+
+if (retryWarning) {
+
+const retryText = (retryWarning.innerText || retryWarning.textContent || '').replace(/\s+/g, ' ').trim();
+
+await dismissModal(retryWarning);
+
+throw new Error('Kurtarma sonrası adet kaydedilemedi: ' + retryText);
+
+}
+
+return;
+
+}
 
 throw terr('Adet kaydedilemedi: ' + t);
 
@@ -2266,7 +2334,7 @@ if (it.bumpFrom === undefined) it.bumpFrom = cur; // ilk denemedeki adet
 
 if (Math.abs(cur - (it.bumpFrom + bump)) < 1e-6) log(' adet zaten artırılmış görünüyor (önceki deneme kaydetmiş), tekrar artırılmıyor', 'warn');
 
-else await bumpQuantity(bump);
+else await bumpQuantity(bump, ctxOf(getRow(ctxOf(row)) || row));
 
 bumped.add(it.id); saveBumped(bumped);
 
