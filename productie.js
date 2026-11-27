@@ -28,7 +28,7 @@
     deletePosterior: true,    // "posterioare datei" sorusundaki kalem, Da(toate)'ten sonra da kilit kapanmazsa detaydan silinir
     priceAdjust: false,       // true: PRET'i bölme sonucunun ±3 binde birinde VALOARE'yi en iyi eşitleyecek şekilde seç (varsayılan: düz CONSUMURI / CANTITATE)
     fixPrice: true,           // Validate bitince CONSUMURI nihai değerine ulaşır; VALOARE ≠ CONSUMURI ise: Devalidez -> PRET = CONSUMURI / CANTITATE -> Alt+S -> tekrar Validate
-    verifyLock: true,         // Validate sonrası satırın kilidinin kapandığını kontrol et (grid canlı güncellenmiyorsa false yap)
+    verifyLock: false,         // Validate sonrası satırın kilidinin kapandığını kontrol et (grid canlı güncellenmiyorsa false yap)
     confirmValidateAll: true, // Validate All başlamadan önce onay sor (false: sormadan başla)
     pauseOnUnknown: true,     // bilinmeyen Da/Nu sorusunda hata verme: loga yaz, elle cevaplanmasını bekle (en çok 10 dk), sonra devam et
     bigJob: 100,              // bu kadar kayıttan fazlası bulunursa başlamadan önce onay sor
